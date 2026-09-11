@@ -1,21 +1,56 @@
-# Isaac Sim MCP 三層架構 · DGX 部署組態
+# Isaac Sim MCP · Three-Plane Deployment on DGX
 
-DGX Spark 上「Isaac Sim ← 閘道 ← NemoClaw 沙箱」三層架構的組態鏡像。
+> **A security-conscious deployment pattern for connecting Isaac Sim to a NemoClaw sandbox through a dedicated MCP Gateway.**
 
-**DGX 是唯一的真相來源。** 這個 repo 用於版控、審閱，以及機器重灌時還原 —— 不是可執行的專案，直接 clone 下來不會跑起來任何東西。
+[![Isaac Sim](https://img.shields.io/badge/Isaac%20Sim-6.0.0--rc.22-76B900?logo=nvidia&logoColor=white)](#)
+[![NemoClaw](https://img.shields.io/badge/NemoClaw-v0.0.118--30-76B900?logo=nvidia&logoColor=white)](#)
+[![OpenShell](https://img.shields.io/badge/OpenShell-0.0.106-444444)](#)
+[![Docker](https://img.shields.io/badge/Docker-29.2.1-2496ED?logo=docker&logoColor=white)](#)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-驗證環境：DGX Spark（GB10, 121 GB unified memory, arm64）· Isaac Sim `6.0.0-rc.22` · NemoClaw `v0.0.118-30` · OpenShell `0.0.106` · Docker `29.2.1`
+Configuration mirror for an "Isaac Sim ← gateway ← NemoClaw sandbox" deployment on a DGX Spark.
 
-### 佔位符
+This repo exists for version control, review, and rebuilding the machine from scratch — it is not a runnable project, and cloning it will not start anything.
 
-這份公開鏡像把部署專屬的位址換成了佔位符。照著還原時全部替換成你自己的值：
+Verified on: DGX Spark (GB10, 121 GB unified memory, arm64) · Isaac Sim `6.0.0-rc.22` · NemoClaw `v0.0.118-30` · OpenShell `0.0.106` · Docker `29.2.1`
 
-| 佔位符 | 意義 | 例 |
+## At a Glance
+
+| Plane | Role | Endpoint | Trust Boundary |
+|---|---|---|---|
+| **A · Simulation** | Isaac Sim + MCP extension | `127.0.0.1:8766` | Loopback only |
+| **B · Gateway** | TLS, auth, allowlist, audit | `<GATEWAY_IP>:8443` | Sole external entry point |
+| **C · Sandbox** | NemoClaw + OpenClaw | `172.19.0.2` | Deny by default |
+
+> [!IMPORTANT]
+> **Plane B is mandatory.** Plane A is intentionally isolated from the sandbox; all MCP traffic must pass through the Gateway, where authentication, tool allowlisting, and auditing are enforced.
+
+
+## Contents
+
+- [At a Glance](#at-a-glance)
+- [Deployment Placeholders](#-deployment-placeholders)
+- [Architecture](#-architecture)
+- [File Map](#-file-map)
+- [Synchronization](#-synchronization)
+- [Restoring from Scratch](#-restoring-from-scratch)
+- [Why `tls: skip`](#-why-tls-skip)
+- [Four-Layer Acceptance](#-four-layer-acceptance)
+- [Troubleshooting Quick Reference](#-troubleshooting-quick-reference)
+- [Rules That Bite Repeatedly](#-rules-that-bite-repeatedly)
+- [Upstream](#-upstream)
+- [License](#-license)
+
+## 🔧 Deployment Placeholders
+
+This public mirror replaces deployment-specific addresses with placeholders. Substitute your own values before following the restore guide:
+
+| Placeholder | Meaning | Example |
 |---|---|---|
-| `<GATEWAY_IP>` | 閘道監聽的位址（Plane C 唯一被放行的目的地） | `10.0.0.5` |
-| `<GATEWAY_HOST>` | 憑證 CN / SAN 用的主機名 | `isaac-gw.local` |
+| `<GATEWAY_IP>` | Address the gateway listens on — the only destination Plane C is allowed to reach | `10.0.0.5` |
+| `<GATEWAY_HOST>` | Hostname used for the certificate's CN and SAN | `isaac-gw.local` |
 
-一次改完：
+Replace them all at once:
 
 ```bash
 grep -rl '<GATEWAY_IP>\|<GATEWAY_HOST>' . \
@@ -24,101 +59,104 @@ grep -rl '<GATEWAY_IP>\|<GATEWAY_HOST>' . \
 
 ---
 
-## 架構
+## 🏗️ Architecture
 
 ```
 ┌─ DGX Spark host ─────────────────────────────────────────────┐
 │                                                               │
-│  Plane A · 模擬          Plane B · 閘道        Plane C · 沙箱   │
-│  Isaac Sim 6.0     ←──   mcp-gateway     ←──   OpenClaw       │
-│  127.0.0.1:8766          <GATEWAY_IP>:8443     172.19.0.2     │
-│  （只綁 loopback）        TLS + bearer          deny-by-default │
-│                          工具白名單 + audit                     │
+│  Plane A · simulation   Plane B · gateway    Plane C · sandbox │
+│  Isaac Sim 6.0     ←──  mcp-gateway      ←── OpenClaw         │
+│  127.0.0.1:8766         <GATEWAY_IP>:8443    172.19.0.2       │
+│  (loopback only)        TLS + bearer         deny-by-default  │
+│                         tool allowlist + audit                │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-一次工具呼叫的路徑：
+**Request path for a single tool call**
 
 ```
 sandbox (172.19.0.2)
-   │  OPA 政策：僅允許 <GATEWAY_IP>:8443，tls: skip
+   │  OPA policy: <GATEWAY_IP>:8443 only, tls: skip
    ▼
-gateway :8443  →  TLS 終結 → Bearer 驗證 → 工具白名單 → 稽核日誌
+gateway :8443  →  TLS termination → bearer auth → tool allowlist → audit log
    │  stdio
    ▼
 isaacsim-mcp-server  →  extension 127.0.0.1:8766  →  PhysX
 ```
 
-Plane A 的 socket 只綁 loopback，Plane C 看不到它。**唯一入口是 Plane B**，三層的安全性全靠這個結構，任何一層繞過都讓其餘兩層失去意義。
+Plane A's socket binds to loopback only, so Plane C cannot see it. **Plane B is the sole entry point.** The whole security argument rests on that structure: bypass any one plane and the other two stop meaning anything.
 
-| 平面 | 元件 | 監聽 | 目錄 |
+| Plane | Component | Listens on | Directory |
 |---|---|---|---|
-| A · 模擬層 | Isaac Sim + `isaac.sim.mcp_extension` | `127.0.0.1:8766` | `plane-a-isaacsim/` |
-| B · 閘道層 | `isaacsim-mcp-gateway`（自行開發） | `<GATEWAY_IP>:8443` | `plane-b-gateway/` |
-| C · 代理層 | NemoClaw sandbox `isaacauto` + OpenClaw | `172.19.0.2` | `plane-c-nemoclaw/` |
+| A · simulation | Isaac Sim + `isaac.sim.mcp_extension` | `127.0.0.1:8766` | `plane-a-isaacsim/` |
+| B · gateway | `isaacsim-mcp-gateway` (written for this deployment) | `<GATEWAY_IP>:8443` | `plane-b-gateway/` |
+| C · agent | NemoClaw sandbox `isaacauto` + OpenClaw | `172.19.0.2` | `plane-c-nemoclaw/` |
 
 ---
 
-## 檔案對照
+## 📁 File Map
 
-| 本 repo | DGX 上的位置 |
+| In this repo | Where it lives on the DGX |
 |---|---|
-| `plane-a-isaacsim/isaacsim-mcp.service` | `~/.config/systemd/user/`（串流版，目前生效） |
-| `plane-a-isaacsim/isaacsim-mcp.service.headless.bak` | 同上目錄的備份（無視窗版） |
+| `plane-a-isaacsim/isaacsim-mcp.service` | `~/.config/systemd/user/` (streaming build, currently active) |
+| `plane-a-isaacsim/isaacsim-mcp.service.headless.bak` | same directory, headless variant kept as a backup |
 | `plane-b-gateway/app.py` | `~/isaac-mcp/gateway/app.py` |
 | `plane-b-gateway/isaacsim-mcp-gateway.service` | `~/.config/systemd/user/` |
-| `plane-b-gateway/gateway.env.example` | `~/isaac-mcp/gateway/gateway.env` 的**範本** |
+| `plane-b-gateway/gateway.env.example` | **template** for `~/isaac-mcp/gateway/gateway.env` |
 | `plane-c-nemoclaw/isaacsim-gw.yaml` | `~/isaac-mcp/isaacsim-gw.yaml` |
-| `plane-c-nemoclaw/mcporter.json.example` | sandbox 內 `/sandbox/.openclaw/workspace/config/mcporter.json` 的**範本** |
-| `plane-c-nemoclaw/skills/franka-motion/` | `nemoclaw skill install` 用的 skill 定義 |
-| `scripts/stage.sh` | 白名單同步腳本，在 DGX 上執行 |
-| `scripts/verify.sh` | 四層驗收 |
-| `scripts/backup-state.sh` | 完整狀態備份（機密另存 `secrets/`，不進版控） |
-| `scripts/fetch-from-dgx.sh` | 從筆電端同步組態回來 |
+| `plane-c-nemoclaw/mcporter.json.example` | **template** for `/sandbox/.openclaw/workspace/config/mcporter.json` inside the sandbox |
+| `plane-c-nemoclaw/skills/franka-motion/` | skill definition for `nemoclaw skill install` |
+| `scripts/stage.sh` | allowlist sync script, run on the DGX |
+| `scripts/verify.sh` | the four-layer acceptance check |
+| `scripts/backup-state.sh` | full state backup (secrets go to `secrets/`, never to version control) |
+| `scripts/fetch-from-dgx.sh` | pull configuration back from a laptop |
 
-### 刻意不納入版控
+### 🔒 Deliberately Not Tracked
 
-| 未收錄 | 原因 |
+| Excluded | Why |
 |---|---|
-| `gateway/token.txt`、`gateway/gateway.env` | Bearer token。重建時重新產生，不要在機器之間搬 |
-| `gateway/tls/gateway.key` | 私鑰。憑證要換就重簽 |
-| `gateway/tls/gateway.crt` | 公開憑證本身無害，但 SAN 內嵌部署的 IP 與主機名，而 SAN 在簽章涵蓋範圍內、無法改寫。還原時依下方 Plane B 的指令重簽即可 —— 反正你也需要對應的私鑰 |
-| `gateway/audit.log` | 執行期產生的稽核紀錄，不是組態 |
-| `~/.nemoclaw/rebuild-backups/`、`~/isaac-mcp-backups/` | 含完整沙箱狀態與 bearer token |
-| `isaac-mcp/src/`（上游程式碼） | 見下方「上游」一節 |
+| `gateway/token.txt`, `gateway/gateway.env` | Bearer token. Regenerate on rebuild; do not carry it between machines |
+| `gateway/tls/gateway.key` | Private key. If the certificate needs replacing, re-sign it |
+| `gateway/tls/gateway.crt` | The certificate itself is harmless, but its SAN embeds the deployment's IP and hostname — and the SAN is inside the signed blob, so it cannot be rewritten. Re-sign it using the Plane B command below; you need the matching private key anyway |
+| `gateway/audit.log` | Runtime audit output, not configuration |
+| `~/.nemoclaw/rebuild-backups/`, `~/isaac-mcp-backups/` | Full sandbox state, including bearer tokens |
+| `isaac-mcp/src/` (upstream code) | See [Upstream](#upstream) |
 
-這份清單靠的是**白名單**而不是 `.gitignore`：`scripts/stage.sh` 只複製列出的檔案，沒列到的不可能意外進來。`.gitignore` 是第二層保險，`.git/hooks/pre-commit` 是第三層。
+This list is enforced by an **allowlist**, not by `.gitignore`: `scripts/stage.sh` copies only the files it names, so anything absent from that list cannot arrive by accident. `.gitignore` is the second layer and `.git/hooks/pre-commit` the third.
 
 ---
 
-## 同步方式
+## 🔄 Synchronization
 
-DGX 上的組態改動之後，在 DGX 本機執行：
+After changing configuration on the DGX, run this on the DGX itself:
 
 ```bash
-GATEWAY_IP=你的位址 GATEWAY_HOST=你的主機名 bash scripts/stage.sh
+GATEWAY_IP=your.address GATEWAY_HOST=your.hostname bash scripts/stage.sh
 git diff --stat
 ```
 
-`stage.sh` 做三件事，缺一不可：
+`stage.sh` does three things, and all three matter:
 
-1. **白名單複製** —— 只取列在腳本裡的檔案
-2. **去識別化** —— 抽掉 `mcporter.json` 的 bearer token，並把 `GATEWAY_IP` / `GATEWAY_HOST` 換成佔位符
-3. **驗證** —— 複製完回頭掃一次，還找得到真實位址或疑似機密就 `exit 1`，不讓它進到可 commit 的狀態
+1. **Allowlist copy** — only the files named in the script
+2. **De-identification** — strips the bearer token out of `mcporter.json`, and rewrites `GATEWAY_IP` / `GATEWAY_HOST` to placeholders
+3. **Verification** — re-scans afterwards and exits non-zero if a real address or a likely secret survived, so it never reaches a committable state
 
-diff 確認合理再 commit。
+Review the diff before committing.
 
-⚠️ **不要手動編輯 `plane-*/` 底下的檔案** —— 下次 `stage.sh` 會從 DGX 的真實檔案覆蓋回去，而 diff 看起來會像「組態變了」而不是「編輯被還原了」。需要固定的改寫請加進 `stage.sh`，不要加在檔案裡。
+> [!WARNING]
+> **Do not hand-edit files under `plane-*/`.** The next `stage.sh` run overwrites them from the live DGX files, and the diff will read as "the configuration changed" rather than "my edit was reverted."
+>
+> Any rewrite you want to persist belongs in `stage.sh`, not in the staged file.
 
 ### pre-commit hook
 
-hook 不會跟著 `git clone` 走，每個工作副本都要自己裝一次：
+Hooks do not travel with `git clone`, so install this once in every working copy:
 
 ```bash
 cat > .git/hooks/pre-commit <<'EOF'
 #!/usr/bin/env bash
 if git diff --cached -U0 | grep -nE 'BEGIN .*PRIVATE KEY|GATEWAY_TOKEN=[0-9a-f]{16}|Bearer [0-9a-f]{16}|sk-proj-[A-Za-z0-9_-]{40}|nvapi-[A-Za-z0-9_-]{20}'; then
-  echo "✗ 偵測到疑似機密，commit 中止。"
+  echo "Possible secret detected — commit aborted."
   exit 1
 fi
 EOF
@@ -127,11 +165,24 @@ chmod +x .git/hooks/pre-commit
 
 ---
 
-## 從零還原
+## ♻️ Restoring from Scratch
 
-各階段之間有依賴，不可跳過或調換。
+The stages depend on each other. **Do not skip or reorder them.**
 
-### Plane A
+```text
+Plane A · Isaac Sim
+        │
+        ▼
+Plane B · MCP Gateway
+        │  TLS · Bearer Auth · Allowlist · Audit
+        ▼
+Plane C · NemoClaw / OpenClaw
+        │
+        ▼
+Real Agent Turn
+```
+
+### Plane A · Simulation
 
 ```bash
 mkdir -p ~/isaac-mcp
@@ -140,24 +191,24 @@ export PATH="$HOME/.local/bin:$PATH"
 cd ~/isaac-mcp/src && ./scripts/setup_python_env.sh
 ```
 
-用 repo 自帶的啟動腳本，**不要**自行組裝 Kit 指令，也**不要**把 extension symlink 到 `extsUser` —— Kit 靠 `--ext-folder` 指向 repo 根目錄來發現它。
+Use the launcher the repo ships. Do **not** assemble the Kit command yourself, and do **not** symlink the extension into `extsUser` — Kit discovers it through `--ext-folder` pointing at the repo root.
 
-放回 `plane-a-isaacsim/isaacsim-mcp.service` 到 `~/.config/systemd/user/`，然後：
+Put `plane-a-isaacsim/isaacsim-mcp.service` back into `~/.config/systemd/user/`, then:
 
 ```bash
 sudo loginctl enable-linger nvidia
 systemctl --user daemon-reload && systemctl --user enable --now isaacsim-mcp
-ss -ltn | grep 8766        # 應為 127.0.0.1:8766
+ss -ltn | grep 8766        # expect 127.0.0.1:8766
 ```
 
-### Plane B
+### Plane B · Gateway
 
 ```bash
 mkdir -p ~/isaac-mcp/gateway/tls && cd ~/isaac-mcp/gateway
 uv venv && uv pip install fastmcp uvicorn
 ```
 
-放回 `app.py`，重簽憑證（**SAN 必須同時含主機名與 IP**，且檔案不可為群組可寫）：
+Put `app.py` back and re-sign the certificate. **The SAN must carry both the hostname and the IP**, and the files must not be group-writable:
 
 ```bash
 openssl req -x509 -newkey rsa:4096 -sha256 -days 825 -nodes \
@@ -167,46 +218,49 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 825 -nodes \
 chmod 644 tls/gateway.crt && chmod 600 tls/gateway.key
 ```
 
-產生 token 與 `gateway.env`：
+Generate the token and `gateway.env`:
 
 ```bash
 openssl rand -hex 32 > token.txt && chmod 600 token.txt
 printf 'GATEWAY_TOKEN=%s\n' "$(cat token.txt)" > gateway.env && chmod 600 gateway.env
 ```
 
-service 檔以 `EnvironmentFile=` 讀取，所以 token 不會出現在 unit 檔、argv 或 `ps` 輸出裡。
+The unit reads it through `EnvironmentFile=`, so the token never appears in the unit file, in argv, or in `ps` output.
 
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now isaacsim-mcp-gateway
-ss -ltn | grep 8443        # 應為 <GATEWAY_IP>:8443
+ss -ltn | grep 8443        # expect <GATEWAY_IP>:8443
 ```
 
-### Plane C
+### Plane C · Sandbox / Agent
 
 ```bash
 sudo nemoclaw onboard --name isaacauto
 ```
 
-互動選項**照文字找，不要照編號按** —— provider 選單的編號會隨偵測到的環境浮動。
+Pick the interactive options **by their text, not by their number** — the numbering in the provider menu shifts with whatever the tool detects in the environment.
 
-⚠️ 不要選 `Personal` policy tier，它是單向門（`policy/index.js:1487`：*"Personal open internet cannot be removed in place"*），只能重建沙箱。
-⚠️ API Key 一律在互動提示裡貼，不要寫成 `sudo NVIDIA_API_KEY=... nemoclaw ...` —— `sudo` 的 `VAR=value` 是 argv 的一部分，會出現在 `ps` 輸出和 shell history。
+> [!CAUTION]
+> **Do not choose the `Personal` policy tier.** It is a one-way door (`policy/index.js:1487`: *"Personal open internet cannot be removed in place"*), and the only way out is rebuilding the sandbox.
+
+> [!WARNING]
+> **Always paste the API key at the interactive prompt.** Never write `sudo NVIDIA_API_KEY=... nemoclaw ...` — with `sudo`, `VAR=value` is part of argv, so it lands in `ps` output and in shell history.
 
 ```bash
-# 把閘道憑證烤進沙箱映像
+# bake the gateway certificate into the sandbox image
 sudo bash -c 'NEMOCLAW_CORPORATE_CA_BUNDLE=/home/nvidia/isaac-mcp/gateway/tls/gateway.crt \
   nemoclaw isaacauto rebuild -y'
 
-# 套用網路政策
+# apply the network policy
 sudo nemoclaw isaacauto policy add \
   --from-file /home/nvidia/isaac-mcp/isaacsim-gw.yaml \
   --trusted-private-host <GATEWAY_IP> -y
 
-# 移除 managed MCP 註冊（刻意為之，見下節）
+# drop the managed MCP registration (deliberate — see the next section)
 sudo nemoclaw isaacauto mcp remove isaacsim --force
 ```
 
-依 `plane-c-nemoclaw/mcporter.json.redacted` 的形狀填入真 token 後上傳，然後**必須**重啟讓 OpenClaw 重讀：
+Fill in the real token following the shape of `plane-c-nemoclaw/mcporter.json.example`, upload it, and then restart so OpenClaw re-reads it — this restart is **not** optional:
 
 ```bash
 sudo nemoclaw isaacauto upload ~/isaac-mcp/mcporter.json \
@@ -214,7 +268,7 @@ sudo nemoclaw isaacauto upload ~/isaac-mcp/mcporter.json \
 sudo nemoclaw isaacauto gateway restart
 ```
 
-**只上傳 `mcporter.json` 不夠**，還要註冊成 OpenClaw-managed，否則 agent 的工具清單裡一個 Isaac 工具都不會有：
+**Uploading `mcporter.json` is not enough on its own.** It also has to be registered as OpenClaw-managed, or the agent's tool list will contain no Isaac tools at all:
 
 ```bash
 sudo nemoclaw isaacauto exec -- sh -c 'openclaw mcp set isaacsim "$(python3 -c "
@@ -225,100 +279,126 @@ print(json.dumps({\"type\":\"http\",\"url\":s[\"baseUrl\"],\"headers\":s[\"heade
 ")"'
 ```
 
-端點與 token 直接從檔案讀出轉寫，不經過螢幕也不進 shell history。
+The endpoint and token are transcribed straight out of the file — they never cross the screen and never enter shell history.
 
 ---
 
-## 為什麼是 `tls: skip`
+## 🔐 Why `tls: skip`
 
-這是取捨，不是預設值。
+This is a trade-off, not a default.
 
-原始設計走 NemoClaw 受管的 L7 橋接（`mcp add`、`protocol: mcp`）。它在自簽憑證下**無法運作**：OpenShell router 自行終結 TLS，而它的 rustls 客戶端在容器啟動時一次性載入系統根憑證 —— 早於 managed startup 寫入 CA 錨點。表現為政策放行後隨即失敗：
+The original design used NemoClaw's managed L7 bridge (`mcp add`, `protocol: mcp`). It **cannot work** with a self-signed certificate: the OpenShell router terminates TLS itself, and its rustls client loads the native root store once at container start — before managed startup writes the CA anchor. The failure looks like the policy allowing the connection and the connection dying anyway:
 
 ```
 NET:OPEN ALLOWED /usr/local/bin/node -> <GATEWAY_IP>:8443 [policy:mcp_bridge_isaacsim]
-NET:FAIL  <GATEWAY_IP>:8443        ← 約 10 ms 後
+NET:FAIL  <GATEWAY_IP>:8443        ← roughly 10 ms later
 ```
 
-Agent 端顯示 `fetch failed: other side closed`，閘道端毫無日誌。重啟 gateway、重啟容器、把 CA 裝進主機信任庫三種方法都無效，因為載入時機在其之前。
+The agent reports `fetch failed: other side closed` and the gateway logs nothing at all. Restarting the gateway, restarting the container, and installing the CA into the host trust store all fail, because the load happens before any of them.
 
-改用 `tls: skip`（L4 直通）後由 node 自行驗證憑證即可運作。**代價**：router 看不到內容就無法改寫 `Authorization`，真 token 必須落在沙箱內的 `mcporter.json`。
+Switching to `tls: skip` (L4 passthrough) hands verification back to node, which does trust the CA, and it works. **The cost:** the router can no longer see inside the connection, so it cannot rewrite `Authorization` — the real token has to live in `mcporter.json` inside the sandbox.
 
-工具白名單、稽核日誌、單一位址限制**都不受影響**，仍由閘道執行 —— 這也是為什麼 Plane B 那層不能省。
+The tool allowlist, the audit log, and the single-destination restriction are **unaffected**; the gateway still enforces all three. That is precisely why Plane B cannot be dropped.
 
 ---
 
-## 四層驗收
+## ✅ Four-Layer Acceptance
 
-缺一不可，而且只有第四層算數。
+> [!IMPORTANT]
+> **All four checks are required, but only the fourth actually proves end-to-end functionality.**
 
 ```bash
-# 1. 路由
+# 1. routing
 sudo nemoclaw inference get
 
-# 2. 政策
-sudo nemoclaw isaacauto policy list | grep "●"        # 應含 isaacsim-gw
+# 2. policy
+sudo nemoclaw isaacauto policy list | grep "●"        # expect isaacsim-gw
 
-# 3. 工具數
+# 3. tool count
 sudo nemoclaw isaacauto exec -- openclaw mcp probe    # isaacsim: 38 tools
 
-# 4. 真實 agent 回合 ← 唯一算數的一層
+# 4. a real agent turn ← the only layer that counts
 sudo nemoclaw isaacauto agent --agent main --timeout 300 -m "<prompt>"
-tail -5 ~/isaac-mcp/gateway/audit.log                 # 必須出現 "event": "call_tool"
+tail -5 ~/isaac-mcp/gateway/audit.log                 # must contain "event": "call_tool"
 ```
 
-只有回應、沒有 `call_tool`，代表模型把工具呼叫寫成文字，或工具根本沒掛上。
+A response with no `call_tool` means the model wrote the tool call out as prose, or the tools were never attached in the first place.
 
-驗收通過時打 tag 記錄這組版本組合：
+Tag the commit whenever the check passes, to record the version combination it passed with:
 
 ```bash
-git tag -a verified-$(date +%Y%m%d) -m "Isaac Sim 6.0.0-rc.22 · NemoClaw v0.0.118-30 · 四層驗收通過"
+git tag -a verified-$(date +%Y%m%d) -m "Isaac Sim 6.0.0-rc.22 · NemoClaw v0.0.118-30 · four-layer check passed"
 git push origin verified-$(date +%Y%m%d)
 ```
 
-升級之後爛掉時，有一個明確的「已知可用」的點可以 diff 回去比對。
+When a later upgrade breaks something, that gives you a known-good point to diff against.
 
 ---
 
-## 會反覆咬人的規則
+## 🧭 Troubleshooting Quick Reference
 
-**1. `nemoclaw` 一律加 `sudo`。** 註冊表在 `/root/.local/state/nemoclaw/`。以一般使用者執行 `nemoclaw list` 會顯示為空，那不代表沙箱不存在。
+| Symptom | Likely Cause | What to Check |
+|---|---|---|
+| `tools discovered: 0` | `mcp status --tools` limitation with `--trusted-private-host` | Use `openclaw mcp probe` or the audit log |
+| `doctor` says healthy, but Agent fails | Reachability ≠ usability | Run the real Agent-turn validation |
+| Agent has no Isaac tools | MCP registration/config was not reloaded | Re-upload `mcporter.json` and run `gateway restart` |
+| Isaac tools disappear after `onboard` / `inference set` | Sandbox config writer bug | Run `openclaw config validate` |
+| Gateway has no `call_tool` entry | Tool call never reached the Gateway | Check MCP registration and run a real Agent turn |
 
-**2. 不要用 `mcp status --tools` 判斷成敗。** 對任何 `--trusted-private-host` 端點它永遠回報 `tools discovered: 0`，即使一切正常（NemoClaw v0.0.118 的缺陷：`buildMcpToolDiscoveryCommand()` 沒把 `trustedPrivateHosts` 傳給 `normalizeMcpServerUrl()`）。用 `openclaw mcp probe` 或稽核日誌判斷。
+---
 
-**3. `doctor` 說 healthy ≠ 實際能用。** doctor 檢查的是「連得上」，不是「能用」。
+## ⚠️ Rules That Bite Repeatedly
 
-**4. 改 `mcporter.json` 或重啟 Isaac Sim 之後一定要 `gateway restart`。** OpenClaw 在啟動時把設定讀進記憶體就不再重讀。症狀很有迷惑性：`nemoclaw exec` 跑 `mcporter list` 成功（每次重新讀檔），Agent 本身卻失敗。
+### 1. Always run `nemoclaw` with `sudo` The registry lives in `/root/.local/state/nemoclaw/`. Running `nemoclaw list` as an ordinary user reports nothing, which does not mean the sandbox is gone.
 
-**5. `onboard` 和 `inference set` 會寫壞沙箱設定，而 `doctor` 查不出來。** 兩個指令都會「同步沙箱模型識別」，寫入器有 bug，會產生非法的 `agents.defaults`。後果是 OpenClaw 降級運作、只剩內建工具，Isaac 的 38 個工具全部消失。每次跑完都要驗：
+### 2. Do not judge success by `mcp status --tools` Against any `--trusted-private-host` endpoint it always reports `tools discovered: 0`, even when everything works — a defect in NemoClaw v0.0.118, where `buildMcpToolDiscoveryCommand()` does not pass `trustedPrivateHosts` to `normalizeMcpServerUrl()`. Use `openclaw mcp probe` or the audit log instead.
+
+### 3. `doctor` reporting healthy does not mean it works What doctor checks is reachability, not usability.
+
+### 4. Always `gateway restart` after editing `mcporter.json` or restarting Isaac Sim OpenClaw reads its configuration into memory at startup and never re-reads it. The symptom is misleading: `nemoclaw exec` running `mcporter list` succeeds — it re-reads the file every time — while the agent itself fails.
+
+### 5. `onboard` and `inference set` can corrupt the sandbox configuration Both commands "sync the sandbox model identity," and the writer has a bug that produces an invalid `agents.defaults`. The consequence is OpenClaw degrading to built-in tools only, with all 38 Isaac tools disappearing. Verify after every run:
 
 ```bash
 sudo nemoclaw isaacauto exec -- openclaw config validate
 ```
 
-**6. 每次換任務前重設 session。** 前一個任務的約束會殘留並影響判斷。
+### 6. Reset the session between tasks Constraints from the previous task persist and distort the model's judgement.
 
 ---
 
-## 上游
+## 🔗 Upstream
 
-Plane A 使用 [whats2000/isaacsim-mcp-server](https://github.com/whats2000/isaacsim-mcp-server)（MIT），其本身 fork 自 [omni-mcp/isaac-sim-mcp](https://github.com/omni-mcp/isaac-sim-mcp)。
+Plane A uses [whats2000/isaacsim-mcp-server](https://github.com/whats2000/isaacsim-mcp-server) (MIT), which is itself a fork of [omni-mcp/isaac-sim-mcp](https://github.com/omni-mcp/isaac-sim-mcp).
 
-本部署跑的是 [openhoward/isaacsim-mcp-server](https://github.com/openhoward/isaacsim-mcp-server) 的 `feat/set-drive-params` 分支，含四個尚未進入上游的修改：
+This deployment runs the `feat/set-drive-params` branch of [openhoward/isaacsim-mcp-server](https://github.com/openhoward/isaacsim-mcp-server), which carries four changes not yet upstream:
 
-| 修改 | 狀態 |
+| Change | Status |
 |---|---|
-| drive gains 以弧度回報（而非度） | [PR 已送出](https://github.com/whats2000/isaacsim-mcp-server/pulls) |
-| 讀 stage scale 而非假設公分 | 待送 |
-| joint 索引順序與 `get_robot_info` 一致 | 待送 |
-| `set_drive_params`（寫入 `UsdPhysicsDriveAPI`） | 待開 Feature Request |
+| Report drive gains in radians rather than degrees | [PR submitted](https://github.com/whats2000/isaacsim-mcp-server/pulls) |
+| Read the stage scale instead of assuming centimetres | not yet submitted |
+| Index joints in the order `get_robot_info` reports | not yet submitted |
+| `set_drive_params` (writes `UsdPhysicsDriveAPI`) | feature request pending |
 
-上游程式碼**不複製到這個 repo** —— 從 fork clone 即可，避免授權歸屬問題與版本漂移。
+Upstream code is **not copied into this repo** — clone it from the fork instead, which avoids both attribution questions and version drift.
 
 ---
 
-## 授權
+## 🚦 Operational Checklist
+
+Before declaring the deployment healthy:
+
+- [ ] Plane A listens only on `127.0.0.1:8766`
+- [ ] Plane B listens on `<GATEWAY_IP>:8443`
+- [ ] Plane C policy allows only the Gateway destination
+- [ ] `openclaw mcp probe` reports the expected Isaac tools
+- [ ] A real Agent turn produces a `call_tool` entry in `audit.log`
+- [ ] No bearer token, private key, or deployment-specific secret is tracked by Git
+
+---
+
+## 📜 License
 
 [MIT](LICENSE) · Copyright (c) 2026 Howard Chang
 
-本 repo 的內容（systemd unit、gateway 實作、OPA 政策、文件）為原創。上游 MCP server 的授權見該專案本身。
+The contents of this repo — systemd units, the gateway implementation, the OPA policy, and the documentation — are original work. The upstream MCP server carries its own license.
