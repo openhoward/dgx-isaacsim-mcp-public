@@ -1,0 +1,31 @@
+preset:
+  name: isaacsim-gw
+  description: "Isaac Sim MCP gateway on the host LAN address (L4 passthrough)"
+
+network_policies:
+  isaacsim_gw:
+    name: isaacsim_gw
+    endpoints:
+      # tls: skip is load-bearing, not a convenience. Under protocol: mcp the
+      # OpenShell router terminates TLS itself, and its rustls client loads the
+      # native root store once at container start -- before managed startup adds
+      # our CA anchor -- so every connection is ALLOWED by policy and then dies
+      # in the handshake (NET:OPEN ALLOWED followed by NET:FAIL, and the gateway
+      # logs nothing at all). L4 passthrough hands verification back to node,
+      # which does trust the CA via NODE_EXTRA_CA_CERTS.
+      #
+      # The cost is that the router can no longer rewrite the Authorization
+      # header, so the openshell:resolve:env: placeholder stops working and the
+      # real bearer token has to live in mcporter.json. Tool-level enforcement
+      # does not disappear with it: the gateway itself keeps the denylist and
+      # the audit log.
+      - host: '<GATEWAY_IP>'
+        port: 8443
+        tls: skip
+        access: full
+    binaries:
+      - { path: /usr/local/bin/mcporter }
+      - { path: /usr/bin/mcporter }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }

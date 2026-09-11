@@ -1,0 +1,16 @@
+[Unit]
+Description=Isaac Sim headless with isaac.sim.mcp_extension (Plane A)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/isaac-mcp/src
+Environment=ISAACSIM_ROOT=%h/IsaacSim/_build/linux-aarch64/release
+ExecStart=%h/isaac-mcp/src/scripts/run_isaac_sim.sh --no-window
+Restart=on-failure
+RestartSec=15
+# Shader cache compilation on a cold start runs into the minutes.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=isaacsim-mcp-gateway (TLS + bearer auth + tool denylist)
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/isaac-mcp/gateway
+EnvironmentFile=%h/isaac-mcp/gateway/gateway.env
+ExecStart=%h/isaac-mcp/gateway/.venv/bin/uvicorn app:app \
+    --host <GATEWAY_IP> --port 8443 \
+    --ssl-certfile tls/gateway.crt --ssl-keyfile tls/gateway.key
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

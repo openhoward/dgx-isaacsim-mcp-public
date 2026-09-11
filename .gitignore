@@ -1,0 +1,25 @@
+# 機密 —— 絕不進版控
+*.key
+*.pem
+*.env
+!*.env.example
+gateway.env
+token.txt
+secrets/
+
+# 憑證：SAN 內嵌部署位址，無法佔位符化（見 README）
+*.crt
+
+# 真實組態（範本才進版控）
+mcporter.json
+openclaw.json
+
+# 備份目錄：含完整沙箱狀態與 bearer token
+*-backups/
+isaac-mcp-backups/
+
+# 執行期產物
+audit.log
+*.log
+__pycache__/
+.venv/

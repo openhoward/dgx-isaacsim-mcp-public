@@ -1,0 +1,17 @@
+[Unit]
+Description=Isaac Sim (WebRTC streaming) with isaac.sim.mcp_extension (Plane A)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/isaac-mcp/src
+ExecStart=%h/IsaacSim/_build/linux-aarch64/release/isaac-sim.streaming.sh \
+    --ext-folder %h/isaac-mcp/src \
+    --enable isaac.sim.mcp_extension \
+    --/exts/omni.services.livestream.session/quitOnSessionEnded=false
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,4 @@
+# 這個 repo 的內容全部在 Linux 上執行 —— CRLF 會讓 shell 腳本以
+# `bash: \r: command not found` 失敗，systemd unit 也會解析出帶 \r 的值。
+# 一律以 LF 儲存與簽出，不論在哪個平台編輯。
+* text=auto eol=lf
